@@ -17,6 +17,7 @@
 # New: Added advanced analytics as per user requirements in a new tab 'Analytics Summary'
 # Enhanced: PDF now includes all tabs' content (Overview, Issues, Departments, Agents, Trends, Data, Sub Categories, Advanced Analytics) in Arabic with perfect formatting.
 # Fixed: Improved font loading with more URLs, increased timeout, added user-agent for better download reliability. Added warnings if font or modules not loaded.
+# NEW v21.0: Added AI Analytics Assistant (Perplexity API) in Advanced Analytics tab.
 # ================================================================
 import streamlit as st
 import pandas as pd
@@ -43,6 +44,118 @@ except ImportError:
     ARABIC_SUPPORT = False
     def reshape(t): return str(t)
     def get_display(t): return str(t)
+
+# ── PERPLEXITY API CONFIG ─────────────────────────────────────────
+PERPLEXITY_API_KEY = st.secrets.get(
+    "PERPLEXITY_API_KEY",
+    os.getenv("PERPLEXITY_API_KEY")
+)
+
+def call_perplexity_on_tickets(user_query, df_sample, lang="EN"):
+    """
+    Uses PERPLEXITY_API_KEY to call Perplexity chat completions API.
+    Takes:
+      - user_query: str
+      - df_sample: pandas DataFrame (sample of dff)
+      - lang: "EN" or "AR" (from the app)
+    Returns an answer string or an error message string.
+    """
+    if not PERPLEXITY_API_KEY:
+        return ("⚠️ Perplexity API key configured nahi hai. "
+                "PERPLEXITY_API_KEY ko .streamlit/secrets.toml ya "
+                "environment variable me set karein.")
+
+    # Drop helper column if present
+    sample = df_sample.copy()
+    if "_short" in sample.columns:
+        sample = sample.drop(columns=["_short"])
+
+    # Limit to 200 rows
+    if len(sample) > 200:
+        sample = sample.sample(200, random_state=42)
+
+    records_json = sample.to_dict(orient="records")
+
+    # Language instruction
+    if lang == "AR":
+        lang_instruction = (
+            "Please answer in Modern Standard Arabic (فصحى). "
+            "Structure your response clearly with bullet points or numbered lists where appropriate."
+        )
+    else:
+        lang_instruction = (
+            "Please answer in simple, clear English. "
+            "Structure your response with bullet points or numbered lists where appropriate."
+        )
+
+    prompt = f"""You are analyzing IT helpdesk ticket data. Below is a JSON sample of up to 200 tickets.
+
+COLUMNS AVAILABLE:
+- Department: The client department that raised the ticket
+- Service: The service category
+- Main Category: The main issue/problem category
+- Sub Category: The sub-category of the issue
+- Assigned To: The agent/technician assigned
+- Impact: Priority level (e.g. Low, Medium, High, Critical)
+- Creation Date: When the ticket was opened
+- Closing Date: When the ticket was closed
+- Resolution Date: When the ticket was resolved
+- Status: Current ticket status (e.g. Closed, Open, Resolved)
+
+DATA SAMPLE (JSON):
+{records_json}
+
+USER QUESTION:
+{user_query}
+
+INSTRUCTIONS:
+- Answer ONLY based on the data sample provided above.
+- Focus on: ticket volumes, SLA risk (long resolution times), departments with high issues, agent performance, priorities, and trends if identifiable.
+- Do NOT make up data that is not in the sample.
+- {lang_instruction}
+"""
+
+    headers = {
+        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are an expert IT helpdesk analytics assistant. Analyze ticket data and provide clear, actionable insights."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "temperature": 0.25
+    }
+
+    try:
+        response = requests.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+    except requests.exceptions.HTTPError as e:
+        return f"❌ AI request failed (HTTP Error): {str(e)}"
+    except requests.exceptions.ConnectionError as e:
+        return f"❌ AI request failed (Connection Error): {str(e)}"
+    except requests.exceptions.Timeout:
+        return "❌ AI request timed out. Please try again."
+    except Exception as e:
+        return f"❌ AI request failed: {str(e)}"
+
+# ─────────────────────────────────────────────────────────────────
+
 st.set_page_config(page_title="REPORT FOR TICKET RAISED", page_icon="🖥️",
                    layout="wide", initial_sidebar_state="expanded")
 # ── PERFECT ARABIC FONT LOADER ───────────────────────────────────
@@ -1185,6 +1298,43 @@ with tab8:
     st.markdown(f"### نسبة البلاغات المغلقة خلال 24 ساعة: {analytics['pct_24h']:.2f}%")
     st.markdown(f"### نسبة البلاغات >3 أيام: {analytics['pct_gt3d']:.2f}%")
     st.markdown(f"### نسبة البلاغات >7 أيام: {analytics['pct_gt7d']:.2f}%")
+
+    # ══════════════════════════════════════════════════════════════
+    # 🤖 AI ANALYTICS ASSISTANT (PERPLEXITY) — NEW SECTION
+    # ══════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("## 🤖 AI Analytics Assistant (Perplexity)")
+
+    if not PERPLEXITY_API_KEY:
+        st.info(
+            "Perplexity API key configured nahi hai. "
+            "PERPLEXITY_API_KEY ko .streamlit/secrets.toml ya "
+            "environment variable me set karein."
+        )
+    else:
+        default_q = (
+            "Konsi departments aur main categories sabse zyada high/critical impact tickets "
+            "generate kar rahe hain, aur unka average resolution time kya hai?"
+        )
+
+        user_q = st.text_area(
+            "Is filtered data ke bare me AI se kuch bhi poochho:",
+            value=default_q,
+            height=120,
+        )
+
+        if st.button("🔍 Analyze current filtered tickets with AI"):
+            if not user_q or not user_q.strip():
+                st.warning("Please enter a question.")
+            elif len(dff) == 0:
+                st.warning("Filtered data empty hai, AI analysis ke liye koi tickets nahi mile.")
+            else:
+                with st.spinner("Perplexity AI current filtered tickets ka analysis kar raha hai..."):
+                    df_sample = dff.copy()
+                    answer = call_perplexity_on_tickets(user_q, df_sample, lang)
+                st.markdown("### AI Insights")
+                st.markdown(answer)
+
 # ══════════════════════════════════════════════════════════════════
 # PREMIUM PDF EXPORT
 # ══════════════════════════════════════════════════════════════════
